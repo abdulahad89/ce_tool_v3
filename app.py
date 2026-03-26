@@ -8,18 +8,19 @@ import os
 
 # RAG Components
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import PointStruct, VectorParams, Distance, Filter, FieldCondition, MatchValue
+from qdrant_client.http.models import PointStruct, VectorParams, Distance
 import qdrant_client
 
 # Page config
 st.set_page_config(
     page_title="Marketing RAG Agent",
-    page_icon="📊",
+    page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -29,28 +30,24 @@ def init_qdrant():
     """Initialize Qdrant client and collections"""
     client = QdrantClient(":memory:")
     
-    # Create conversion collection
     client.recreate_collection(
         collection_name="conversion_data",
-        vectors_config=VectorParams(size=768, distance=Distance.COSINE),
+        vectors_config=VectorParams(size=1536, distance=Distance.COSINE),  # OpenAI dim
     )
     
-    # Create engagement collection
     client.recreate_collection(
         collection_name="engagement_data",
-        vectors_config=VectorParams(size=768, distance=Distance.COSINE),
+        vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
     )
     
     return client
 
 @st.cache_data
 def generate_sample_data():
-    """Generate 100+ sample records for both tables"""
-    
+    """Generate 150+ sample records (unchanged)"""
     np.random.seed(42)
     dates = pd.date_range('2025-01-01', periods=100, freq='D')
     
-    # Conversion & Incremental Data (150 samples)
     campaigns = [f'Campaign_{i:03d}' for i in range(1, 31)]
     products = ['Product_A', 'Product_B', 'Product_C', 'Product_D', 'Product_E']
     
@@ -79,7 +76,6 @@ def generate_sample_data():
             'roi': sales / (target_conversions * 10)
         })
     
-    # Channel Engagement Data (120 samples)
     channels = ['Email', 'Social_Facebook', 'Social_Instagram', 'Social_LinkedIn', 
                'Display', 'Search', 'Video', 'SMS']
     
@@ -113,8 +109,6 @@ def generate_sample_data():
 
 def create_vectors(client: QdrantClient, df: pd.DataFrame, collection_name: str, embeddings):
     """Convert DataFrame to text documents and store in Qdrant"""
-    
-    # Create text representations
     documents = []
     for _, row in df.iterrows():
         text = f"Campaign: {row['campaign_id']}, "
@@ -134,11 +128,9 @@ def create_vectors(client: QdrantClient, df: pd.DataFrame, collection_name: str,
         
         documents.append(text)
     
-    # Split and embed
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     splits = text_splitter.create_documents([doc for doc in documents])
     
-    # Store in Qdrant
     points = []
     for i, doc in enumerate(splits):
         embedding = embeddings.embed_query(doc.page_content)
@@ -151,28 +143,36 @@ def create_vectors(client: QdrantClient, df: pd.DataFrame, collection_name: str,
     client.upsert(collection_name=collection_name, points=points)
     return len(points)
 
-def setup_rag_system():
-    """Initialize complete RAG system"""
-    # Load API key
-    gemini_api_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
-    if not gemini_api_key:
-        st.error("Please add GEMINI_API_KEY to Streamlit secrets or environment variables")
-        st.stop()
-    
-    # Initialize components
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001",
-        google_api_key=gemini_api_key
-    )
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash",
-        temperature=0,
-        google_api_key=gemini_api_key
-    )
-    
+def get_model_components(model_provider: str):
+    """Get embeddings and LLM based on selected provider"""
+    if model_provider == "OpenAI":
+        api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+        if not api_key:
+            st.error("❌ OpenAI API key not found in secrets!")
+            st.stop()
+        
+        return (
+            OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=api_key),
+            ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=api_key),
+            1536
+        )
+    else:  # Gemini
+        api_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
+        if not api_key:
+            st.error("❌ Gemini API key not found in secrets!")
+            st.stop()
+        
+        return (
+            GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=api_key),
+            ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=api_key),
+            768
+        )
+
+def setup_rag_system(model_provider: str):
+    """Initialize complete RAG system with selected model"""
+    embeddings, llm, embed_dim = get_model_components(model_provider)
     client = init_qdrant()
     
-    # Generate and index data
     if client.get_collection("conversion_data").points_count == 0:
         conv_df, eng_df = generate_sample_data()
         st.session_state.conv_df = conv_df
@@ -180,20 +180,17 @@ def setup_rag_system():
         
         create_vectors(client, conv_df, "conversion_data", embeddings)
         create_vectors(client, eng_df, "engagement_data", embeddings)
-        st.success("✅ Data indexed successfully!")
+        st.success(f"✅ {model_provider} RAG System Ready!")
     
     return client, embeddings, llm
 
-# RAG Chain
 def format_docs(docs):
     return "\n\n".join(doc.payload["text"] for doc in docs)
 
 @st.cache_resource
-def create_rag_chain(client, embeddings, llm):
+def create_rag_chain(client, embeddings, llm, _model_provider):
     def retrieve_docs(query, k=5):
         search_results = []
-        
-        # Search both collections
         for collection in ["conversion_data", "engagement_data"]:
             hits = client.search(
                 collection_name=collection,
@@ -202,7 +199,6 @@ def create_rag_chain(client, embeddings, llm):
                 query_filter=None
             )
             search_results.extend(hits)
-        
         return search_results[:k]
     
     def rag_chain(query):
@@ -210,72 +206,83 @@ def create_rag_chain(client, embeddings, llm):
         context = format_docs(docs)
         
         prompt = ChatPromptTemplate.from_template(
-            """You are a marketing analytics expert. Answer the question based only on the provided context about campaign performance data.
-            
-            Context:
-            {context}
-            
-            Question: {question}
-            
-            Provide a clear, data-driven answer with specific numbers and insights. If asked for analysis, include trends, comparisons, and recommendations."""
+            """You are a marketing analytics expert. Use only the provided campaign data context to answer.
+
+Context from {table}:
+{context}
+
+Question: {question}
+
+Answer with specific numbers, trends, and insights from the data."""
         )
         
         chain = (
-            {"context": RunnablePassthrough(), "question": RunnablePassthrough()}
+            {"context": RunnablePassthrough(), "question": RunnablePassthrough(), "table": RunnablePassthrough()}
             | prompt
             | llm
             | StrOutputParser()
         )
         
-        return chain.invoke({"context": context, "question": query})
+        return chain.invoke({"context": context, "question": query, "table": "conversion & engagement tables"})
     
     return rag_chain
 
 # Streamlit UI
 def main():
-    st.title("📊 Marketing RAG Analytics Agent")
-    st.markdown("**Lightweight RAG agent for conversion & engagement analysis**")
+    st.title("🤖 Marketing RAG Agent - Multi-Model")
+    st.markdown("**Toggle between OpenAI GPT-4o-mini & Gemini 1.5 Flash**")
     
-    # Sidebar
+    # Sidebar - Model Selection
     with st.sidebar:
-        st.header("⚙️ Configuration")
-        if 'system_setup' not in st.session_state:
-            with st.spinner("Setting up RAG system..."):
-                st.session_state.client, st.session_state.embeddings, st.session_state.llm = setup_rag_system()
-                st.session_state.system_setup = True
+        st.header("🎯 Model Selection")
         
-        st.success("✅ RAG System Ready!")
+        model_options = ["OpenAI (GPT-4o-mini)", "Gemini 1.5 Flash"]
+        selected_model = st.selectbox("Choose LLM:", model_options, index=1)
+        model_provider = "OpenAI" if "OpenAI" in selected_model else "Gemini"
+        
+        st.info(f"**Selected:** {selected_model}")
+        
+        if st.button("🔄 Rebuild Index", type="secondary"):
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.rerun()
+        
+        # Setup system
+        if 'system_setup' not in st.session_state or st.session_state.get('last_model') != model_provider:
+            with st.spinner(f"Setting up {model_provider} RAG..."):
+                st.session_state.client, st.session_state.embeddings, st.session_state.llm = setup_rag_system(model_provider)
+                st.session_state.system_setup = True
+                st.session_state.last_model = model_provider
         
         # Data preview
         if 'conv_df' in st.session_state:
-            st.subheader("Sample Data")
+            st.subheader("📋 Sample Data")
             col1, col2 = st.columns(2)
             with col1:
                 st.dataframe(st.session_state.conv_df.head(3), use_container_width=True)
             with col2:
                 st.dataframe(st.session_state.eng_df.head(3), use_container_width=True)
     
-    # Main chat interface
+    # Chat interface
     if 'messages' not in st.session_state:
         st.session_state.messages = []
     
-    # Display chat history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
     
-    # Chat input
-    if prompt := st.chat_input("Ask about campaigns, conversions, engagement, ROI, or channel performance..."):
+    if prompt := st.chat_input("Ask about campaigns, ROI, CTR, channel performance..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
         
         with st.chat_message("assistant"):
-            with st.spinner("Analyzing marketing data..."):
+            with st.spinner(f"{'🤖' if model_provider=='OpenAI' else '⭐'} {model_provider} analyzing..."):
                 rag_chain = create_rag_chain(
                     st.session_state.client, 
                     st.session_state.embeddings, 
-                    st.session_state.llm
+                    st.session_state.llm,
+                    model_provider
                 )
                 response = rag_chain(prompt)
                 st.markdown(response)
